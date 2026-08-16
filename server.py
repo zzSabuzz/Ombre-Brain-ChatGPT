@@ -1977,6 +1977,7 @@ async def _build_handoff_breath(max_tokens: int = 1200, session_id: str = "", de
     self_anchor = _format_handoff_self_anchor(all_buckets, limit=1)
     anchors = _format_handoff_anchors(all_buckets, limit=2)
     care_memos = _format_handoff_care_memos(session_id=session_id, limit=3)
+    recent_year_rings = _format_handoff_recent_year_rings(all_buckets, limit=3, max_chars=90)
     self_core = _trim_handoff_text_to_token_budget(self_anchor, 110)
     self_growth = _trim_handoff_text_to_token_budget(
         _handoff_portrait_stable_body(persona_portrait),
@@ -1997,6 +1998,7 @@ async def _build_handoff_breath(max_tokens: int = 1200, session_id: str = "", de
         ("Current Focus", current_focus, 120, True),
         ("Relationship Portrait", relationship_portrait, 160, False),
         ("Recent Continuity", recent_continuity, 650, True),
+        ("最近年轮", recent_year_rings, 180, True),
         ("照顾备忘", care_memos, 180, True),
         ("Optional Anchors", anchors, 90, True),
     ]
@@ -2151,6 +2153,53 @@ def _format_handoff_recent_continuity(all_buckets: list[dict], limit: int = 3) -
             continue
         lines.append(f"- [{created}] [bucket_id:{bucket.get('id', '')}] {name}: {text}")
     return "\n".join(lines)
+
+
+def _format_handoff_recent_year_rings(
+    all_buckets: list[dict],
+    *,
+    lookback_days: int = 7,
+    limit: int = 3,
+    max_chars: int = 90,
+) -> str:
+    now = datetime.now(_handoff_timezone())
+    cutoff = now - timedelta(days=max(1, int(lookback_days or 7)))
+    rows: list[tuple[datetime, int, str]] = []
+    for bucket in all_buckets:
+        if is_self_anchor_bucket(bucket) or _is_special_memory_bucket(bucket):
+            continue
+        bucket_id = str(bucket.get("id") or "").strip()
+        meta = bucket.get("metadata", {}) if isinstance(bucket.get("metadata"), dict) else {}
+        title = _clip_text(str(meta.get("name") or bucket_id).strip(), 36)
+        comments = meta.get("comments", [])
+        if not isinstance(comments, list):
+            continue
+        for index, comment in enumerate(comments):
+            if not isinstance(comment, dict):
+                continue
+            created_at = _handoff_parse_local_datetime(comment.get("created"))
+            if created_at is None or created_at < cutoff or created_at > now + timedelta(minutes=5):
+                continue
+            content = " ".join(strip_wikilinks(str(comment.get("content") or "")).split())
+            content = _clip_text(content, max_chars)
+            if not content:
+                continue
+            details = [created_at.date().isoformat()]
+            author = str(comment.get("author") or "").strip()
+            if author:
+                details.append(author)
+            kind = str(comment.get("kind") or "comment").strip()
+            if kind:
+                details.append(kind)
+            rows.append(
+                (
+                    created_at,
+                    index,
+                    f"- 🌀 [{' · '.join(details)}] [bucket_id:{bucket_id}] {title}: {content}",
+                )
+            )
+    rows.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    return "\n".join(line for _created_at, _index, line in rows[: max(0, limit)])
 
 
 def _is_pending_followup_domain(domain_key: str) -> bool:
@@ -3474,14 +3523,14 @@ async def breath_hook(request):
         parts = []
         token_budget = 10000
         for b in pinned:
-            summary = await dehydrator.dehydrate(_bucket_text_for_embedding(b), {k: v for k, v in b["metadata"].items() if k != "tags"})
+            summary = await dehydrator.dehydrate(_bucket_text_for_dehydration(b), _bucket_metadata_for_dehydration(b))
             parts.append(f"📌 [核心准则] {summary}")
             token_budget -= count_tokens_approx(summary)
 
         for b in anchors:
             if token_budget <= 0:
                 break
-            summary = await dehydrator.dehydrate(_bucket_text_for_embedding(b), {k: v for k, v in b["metadata"].items() if k != "tags"})
+            summary = await dehydrator.dehydrate(_bucket_text_for_dehydration(b), _bucket_metadata_for_dehydration(b))
             entry = f"⚓ [长期锚点] [bucket_id:{b['id']}] {summary}"
             entry_tokens = count_tokens_approx(entry)
             if entry_tokens > token_budget:
@@ -3502,7 +3551,7 @@ async def breath_hook(request):
         for b in candidates:
             if token_budget <= 0:
                 break
-            summary = await dehydrator.dehydrate(_bucket_text_for_embedding(b), {k: v for k, v in b["metadata"].items() if k != "tags"})
+            summary = await dehydrator.dehydrate(_bucket_text_for_dehydration(b), _bucket_metadata_for_dehydration(b))
             summary_tokens = count_tokens_approx(summary)
             if summary_tokens > token_budget:
                 break
@@ -3597,6 +3646,76 @@ def _bucket_text_for_embedding(bucket: dict) -> str:
             if isinstance(comment, dict)
         )
     return f"{bucket_content_for_recall(bucket)}\n{comment_text}".strip()
+
+
+def _bucket_text_for_dehydration(bucket: dict) -> str:
+    """Return bucket body only; year rings are rendered separately after dehydration."""
+    return bucket_content_for_recall(bucket).strip()
+
+
+def _latest_year_ring_comments(bucket: dict, limit: int = 2) -> list[dict]:
+    meta = bucket.get("metadata", {}) if isinstance(bucket.get("metadata"), dict) else {}
+    comments = meta.get("comments", [])
+    if limit <= 0 or not isinstance(comments, list):
+        return []
+
+    ranked: list[tuple[float, int, dict]] = []
+    for index, comment in enumerate(comments):
+        if not isinstance(comment, dict) or not str(comment.get("content") or "").strip():
+            continue
+        parsed = _handoff_parse_local_datetime(comment.get("created"))
+        timestamp = parsed.timestamp() if parsed is not None else float("-inf")
+        ranked.append((timestamp, index, comment))
+    ranked.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    return [dict(comment) for _timestamp, _index, comment in ranked[:limit]]
+
+
+def _format_year_ring_comment(comment: dict, *, max_chars: int = 220) -> str:
+    content = " ".join(strip_wikilinks(str(comment.get("content") or "")).split())
+    content = _clip_text(content, max_chars)
+    if not content:
+        return ""
+    details = []
+    created = _date_yyyy_mm_dd(comment.get("created"))
+    if created:
+        details.append(created)
+    author = str(comment.get("author") or "").strip()
+    if author:
+        details.append(author)
+    kind = str(comment.get("kind") or "comment").strip()
+    if kind:
+        details.append(kind)
+    detail_part = f" [{' · '.join(details)}]" if details else ""
+    comment_id = str(comment.get("id") or "").strip()
+    id_part = f" [comment_id:{comment_id}]" if comment_id else ""
+    return f"🌀 年轮{detail_part}{id_part}: {content}"
+
+
+def _append_bucket_year_rings(
+    block: str,
+    bucket: dict,
+    token_budget: int,
+    *,
+    limit: int = 2,
+    max_chars: int = 220,
+) -> str:
+    result = str(block or "").strip()
+    if not result or token_budget <= 0:
+        return result
+    for comment in _latest_year_ring_comments(bucket, limit=limit):
+        line = _format_year_ring_comment(comment, max_chars=max_chars)
+        if not line:
+            continue
+        candidate = f"{result}\n{line}"
+        if count_tokens_approx(candidate) <= token_budget:
+            result = candidate
+            continue
+        compact_line = _format_year_ring_comment(comment, max_chars=min(90, max_chars))
+        compact_candidate = f"{result}\n{compact_line}" if compact_line else result
+        if compact_line and count_tokens_approx(compact_candidate) <= token_budget:
+            result = compact_candidate
+        break
+    return result
 
 
 def _bucket_context_snippet(bucket: dict, max_chars: int = 180) -> str:
@@ -4753,11 +4872,24 @@ def _context_moments_for_seed(seed: dict, grouped: dict[str, list[dict]]) -> lis
         ordinal = int(moment.get("ordinal") or 0)
         if abs(ordinal - seed_ordinal) == 1 and section not in MOMENT_TEMPERATURE_SECTIONS:
             add_context(moment)
-    for section in ("affect_anchor", "favorite_reason", "comment"):
+    for section in ("affect_anchor", "favorite_reason"):
         for moment in bucket_moments:
             if moment.get("moment_id") != seed_id and moment.get("section") == section:
                 add_context(moment)
                 break
+    year_rings = [
+        moment for moment in bucket_moments
+        if moment.get("moment_id") != seed_id and moment.get("section") == "comment"
+    ]
+    year_rings.sort(
+        key=lambda moment: (
+            str(moment.get("created_at") or ""),
+            int(moment.get("ordinal") or 0),
+        ),
+        reverse=True,
+    )
+    for moment in year_rings[:2]:
+        add_context(moment)
     return contexts[:4]
 
 
@@ -4808,7 +4940,7 @@ async def _format_direct_bucket(
         )
     original_block = f"{header} bucket_original\n{original}" if original else f"{header} bucket_original"
     if count_tokens_approx(original_block) <= token_budget:
-        return original_block
+        return _append_bucket_year_rings(original_block, bucket, token_budget)
 
     wants_capsule = direct_render_mode == "full" or (
         direct_render_mode == "auto"
@@ -4822,10 +4954,16 @@ async def _format_direct_bucket(
             )
             block = f"{header} bucket_capsule\n{capsule}\nmatched_moment: {_moment_text(moment, 220)}"
             if count_tokens_approx(block) <= token_budget:
-                return block
+                return _append_bucket_year_rings(block, bucket, token_budget)
             compact = f"{header} bucket_capsule\n{_clip_text(capsule, 260)}"
             if count_tokens_approx(compact) <= token_budget:
-                return compact
+                return _append_bucket_year_rings(
+                    compact,
+                    bucket,
+                    token_budget,
+                    limit=1,
+                    max_chars=120,
+                )
             return _trim_text_to_token_budget(compact, token_budget)
         except Exception as e:
             logger.warning(f"Direct bucket capsule failed / 直接命中整桶脱水失败: {e}")
@@ -4939,12 +5077,13 @@ def _format_direct_bucket_window(
         f"- [{_moment_label(context)}] [moment_id:{context['moment_id']}] {_moment_text(context, 120)}"
         for context in _context_moments_for_seed(moment, grouped)
         if context.get("section") in MOMENT_TEMPERATURE_SECTIONS
+        and context.get("section") != "comment"
     ][:2]
     if context_lines:
         parts.append("语境:\n" + "\n".join(context_lines))
     block = "\n".join(parts)
     if count_tokens_approx(block) <= token_budget:
-        return block
+        return _append_bucket_year_rings(block, bucket, token_budget)
     compact_parts = [
         f"{header} bucket_window",
         f"matched_moment: {_moment_text(moment, 120)}",
@@ -4953,7 +5092,13 @@ def _format_direct_bucket_window(
         compact_parts.append("original_window:\n" + _clip_text(window, 220))
     compact = "\n".join(compact_parts)
     if count_tokens_approx(compact) <= token_budget:
-        return compact
+        return _append_bucket_year_rings(
+            compact,
+            bucket,
+            token_budget,
+            limit=1,
+            max_chars=120,
+        )
     return _trim_text_to_token_budget(compact, token_budget)
 
 
@@ -7530,9 +7675,16 @@ async def breath(
             if core_token_budget <= 0 or token_budget <= 0:
                 break
             try:
-                clean_meta = {k: v for k, v in b["metadata"].items() if k != "tags"}
-                summary = await dehydrator.dehydrate(_bucket_text_for_embedding(b), clean_meta)
+                summary = await dehydrator.dehydrate(
+                    _bucket_text_for_dehydration(b),
+                    _bucket_metadata_for_dehydration(b),
+                )
                 entry = f"📌 [核心准则] [bucket_id:{b['id']}] {summary}"
+                entry = _append_bucket_year_rings(
+                    entry,
+                    b,
+                    min(core_token_budget, token_budget),
+                )
                 entry_tokens = count_tokens_approx(entry)
                 if entry_tokens > core_token_budget or entry_tokens > token_budget:
                     break
@@ -7550,9 +7702,16 @@ async def breath(
             if anchor_token_budget <= 0 or token_budget <= 0:
                 break
             try:
-                clean_meta = {k: v for k, v in b["metadata"].items() if k != "tags"}
-                summary = await dehydrator.dehydrate(_bucket_text_for_embedding(b), clean_meta)
+                summary = await dehydrator.dehydrate(
+                    _bucket_text_for_dehydration(b),
+                    _bucket_metadata_for_dehydration(b),
+                )
                 entry = f"⚓ [长期锚点] [bucket_id:{b['id']}] {summary}"
+                entry = _append_bucket_year_rings(
+                    entry,
+                    b,
+                    min(anchor_token_budget, token_budget),
+                )
                 entry_tokens = count_tokens_approx(entry)
                 if entry_tokens > anchor_token_budget or entry_tokens > token_budget:
                     break
@@ -7580,10 +7739,13 @@ async def breath(
             if token_budget <= 0:
                 break
             try:
-                clean_meta = {k: v for k, v in b["metadata"].items() if k != "tags"}
-                summary = await dehydrator.dehydrate(_bucket_text_for_embedding(b), clean_meta)
+                summary = await dehydrator.dehydrate(
+                    _bucket_text_for_dehydration(b),
+                    _bucket_metadata_for_dehydration(b),
+                )
                 score = decay_engine.calculate_score(b["metadata"])
                 entry = f"[权重:{score:.2f}] [bucket_id:{b['id']}] {summary}"
+                entry = _append_bucket_year_rings(entry, b, token_budget)
                 entry_tokens = count_tokens_approx(entry)
                 if entry_tokens > token_budget:
                     break
@@ -8077,10 +8239,13 @@ async def breath(
                 for b in drifted:
                     if drift_remaining <= 0:
                         break
-                    clean_meta = {k: v for k, v in b["metadata"].items() if k != "tags"}
-                    summary = await dehydrator.dehydrate(_bucket_text_for_embedding(b), clean_meta)
+                    summary = await dehydrator.dehydrate(
+                        _bucket_text_for_dehydration(b),
+                        _bucket_metadata_for_dehydration(b),
+                    )
                     dormant_days = _bucket_days_since_last_active(b["metadata"])
                     entry = f"[surface_type: resurface, dormant_days={dormant_days:.0f}]\n{summary}"
+                    entry = _append_bucket_year_rings(entry, b, drift_remaining)
                     entry_tokens = count_tokens_approx(entry)
                     if entry_tokens > drift_remaining:
                         break
