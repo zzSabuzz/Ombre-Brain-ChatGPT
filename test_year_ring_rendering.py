@@ -102,7 +102,7 @@ def test_direct_bucket_appends_latest_year_rings_with_metadata():
     assert "2026-08-03 · 阿峙 · feel" in rendered
 
 
-def test_handoff_year_rings_use_comment_time_across_old_buckets():
+def test_handoff_year_rings_use_comment_time_and_backfill_older_comments():
     now = datetime.now(server._handoff_timezone())
     recent = now - timedelta(hours=2)
     older_recent = now - timedelta(days=2)
@@ -134,7 +134,50 @@ def test_handoff_year_rings_use_comment_time_across_old_buckets():
 
     assert rendered.index("今天补给旧桶的新年轮") < rendered.index("两天前的年轮")
     assert "[bucket_id:old-host]" in rendered
-    assert "九天前的年轮" not in rendered
+    assert rendered.index("两天前的年轮") < rendered.index("九天前的年轮")
+
+
+def test_handoff_year_ring_section_keeps_three_compact_rows_within_budget():
+    now = datetime.now(server._handoff_timezone())
+    buckets = []
+    for index in range(3):
+        buckets.append(
+            {
+                "id": f"host-{index}",
+                "content": "宿主正文",
+                "metadata": {
+                    "name": f"这是一个很长的宿主标题{index}",
+                    "comments": [
+                        _comment(
+                            f"ring-{index}",
+                            (now - timedelta(hours=index + 1)).isoformat(),
+                            f"第{index}条年轮" + "很长的回看内容" * 20,
+                        )
+                    ],
+                },
+            }
+        )
+
+    rendered = server._format_handoff_recent_year_rings(
+        buckets,
+        limit=3,
+        max_chars=90,
+        token_budget=180,
+    )
+
+    assert len(rendered.splitlines()) == 3
+    assert all(f"[bucket_id:host-{index}]" in rendered for index in range(3))
+    assert server.count_tokens_approx(rendered) <= 180
+
+
+def test_handoff_year_rings_include_comments_on_permanent_buckets():
+    now = datetime.now(server._handoff_timezone())
+    bucket = _bucket([_comment("permanent-ring", now.isoformat(), "钉选桶里的年轮")])
+    bucket["metadata"]["type"] = "permanent"
+
+    rendered = server._format_handoff_recent_year_rings([bucket])
+
+    assert "钉选桶里的年轮" in rendered
 
 
 def test_handoff_budget_keeps_continuity_and_recent_year_rings():

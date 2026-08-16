@@ -2161,16 +2161,23 @@ def _format_handoff_recent_year_rings(
     lookback_days: int = 7,
     limit: int = 3,
     max_chars: int = 90,
+    token_budget: int = 180,
 ) -> str:
+    limit = max(0, int(limit or 0))
+    token_budget = max(0, int(token_budget or 0))
+    if limit <= 0 or token_budget <= 0:
+        return ''
+
     now = datetime.now(_handoff_timezone())
     cutoff = now - timedelta(days=max(1, int(lookback_days or 7)))
-    rows: list[tuple[datetime, int, str]] = []
+    recent_rows: list[tuple[datetime, int, str, str]] = []
+    older_rows: list[tuple[datetime, int, str, str]] = []
     for bucket in all_buckets:
-        if is_self_anchor_bucket(bucket) or _is_special_memory_bucket(bucket):
+        if is_self_anchor_bucket(bucket):
             continue
         bucket_id = str(bucket.get("id") or "").strip()
         meta = bucket.get("metadata", {}) if isinstance(bucket.get("metadata"), dict) else {}
-        title = _clip_text(str(meta.get("name") or bucket_id).strip(), 36)
+        title = _clip_text(str(meta.get("name") or bucket_id).strip(), 12)
         comments = meta.get("comments", [])
         if not isinstance(comments, list):
             continue
@@ -2178,28 +2185,50 @@ def _format_handoff_recent_year_rings(
             if not isinstance(comment, dict):
                 continue
             created_at = _handoff_parse_local_datetime(comment.get("created"))
-            if created_at is None or created_at < cutoff or created_at > now + timedelta(minutes=5):
+            if created_at is None or created_at > now + timedelta(minutes=5):
                 continue
             content = " ".join(strip_wikilinks(str(comment.get("content") or "")).split())
             content = _clip_text(content, max_chars)
             if not content:
                 continue
             details = [created_at.date().isoformat()]
-            author = str(comment.get("author") or "").strip()
+            author = _clip_text(str(comment.get("author") or "").strip(), 12)
             if author:
                 details.append(author)
-            kind = str(comment.get("kind") or "comment").strip()
-            if kind:
-                details.append(kind)
-            rows.append(
-                (
-                    created_at,
-                    index,
-                    f"- 🌀 [{' · '.join(details)}] [bucket_id:{bucket_id}] {title}: {content}",
-                )
-            )
-    rows.sort(key=lambda item: (item[0], item[1]), reverse=True)
-    return "\n".join(line for _created_at, _index, line in rows[: max(0, limit)])
+            prefix = f"- 🌀 [{' · '.join(details)}] [bucket_id:{bucket_id}] {title}: "
+            row = (created_at, index, prefix, content)
+            (recent_rows if created_at >= cutoff else older_rows).append(row)
+
+    recent_rows.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    older_rows.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    selected = recent_rows[:limit]
+    if len(selected) < limit:
+        selected.extend(older_rows[: limit - len(selected)])
+    if not selected:
+        return ''
+
+    # Keep every selected ring visible. A 90-character Chinese excerpt plus metadata
+    # can consume nearly the whole section budget, causing line-based trimming to
+    # retain only the first row. Give each row an equal share and trim its excerpt.
+    # Leave a small rounding margin because count_tokens_approx truncates each
+    # standalone prefix/content count before the rows are joined.
+    line_budget = max(1, token_budget // len(selected) - 2)
+    lines = []
+    for _created_at, _index, prefix, content in selected:
+        prefix_tokens = count_tokens_approx(prefix)
+        if prefix_tokens >= line_budget:
+            prefix = re.sub(r"\s+[^:]{1,12}: $", ": ", prefix)
+            prefix_tokens = count_tokens_approx(prefix)
+        content_budget = max(1, line_budget - prefix_tokens)
+        clipped_content = _trim_handoff_text_to_token_budget(content, content_budget)
+        if not clipped_content:
+            continue
+        lines.append(f"{prefix}{clipped_content}")
+
+    rendered = "\n".join(lines)
+    if count_tokens_approx(rendered) <= token_budget:
+        return rendered
+    return _trim_lines_to_token_budget(rendered, token_budget)
 
 
 def _is_pending_followup_domain(domain_key: str) -> bool:
